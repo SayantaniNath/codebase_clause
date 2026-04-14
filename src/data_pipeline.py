@@ -90,6 +90,9 @@ def _generate_mock_records(n: int = 100) -> list[dict]:
     referral_sources = ["organic", "social", "email", "paid_search", "referral", "direct"]
     device_types = ["mobile", "desktop", "tablet"]
     browsers = ["Chrome", "Safari", "Firefox", "Edge"]
+    themes = ["dark", "light", "system"]
+    languages = ["en", "es", "fr", "de", "ja", "pt", "hi"]
+    tags_pool = ["early-adopter", "premium", "power-user", "at-risk", "churned", "trial", "vip"]
 
     base_dt = datetime(2026, 4, 13, 0, 0, 0)
     records = []
@@ -103,6 +106,28 @@ def _generate_mock_records(n: int = 100) -> list[dict]:
         login_count = random.randint(0, 500)
         last_login = created_at + timedelta(minutes=random.randint(1, 20000)) if login_count > 0 else None
         plan = random.choice(plans)
+        metadata = {
+            "preferences": {
+                "theme": random.choice(themes),
+                "language": random.choice(languages),
+                "notifications": {
+                    "email": random.choice([True, False]),
+                    "sms": random.choice([True, False]),
+                    "push": random.choice([True, False]),
+                },
+            },
+            "tags": random.sample(tags_pool, k=random.randint(1, 3)),
+            "scores": {
+                "engagement": round(random.uniform(1.0, 10.0), 2),
+                "retention": round(random.uniform(1.0, 10.0), 2),
+                "satisfaction": round(random.uniform(1.0, 10.0), 2),
+            },
+            "last_purchase": {
+                "amount": round(random.uniform(5.0, 500.0), 2),
+                "currency": "USD",
+                "days_ago": random.randint(1, 365),
+            },
+        }
         records.append({
             "id": i,
             "name": name,
@@ -122,6 +147,7 @@ def _generate_mock_records(n: int = 100) -> list[dict]:
             "referral_source": random.choice(referral_sources),
             "device_type": random.choice(device_types),
             "browser": random.choice(browsers),
+            "metadata": metadata,
             "created_at": created_at.strftime("%Y-%m-%d %H:%M:%S"),
         })
     return records
@@ -285,7 +311,7 @@ def main():
         SELECT id, name, email, phone, age, city, country, timezone,
                status, is_verified, two_factor_enabled, subscription_plan,
                monthly_spend, login_count, last_login, referral_source,
-               device_type, browser, created_at
+               device_type, browser, metadata, created_at
         FROM users
         WHERE created_at >= NOW() - INTERVAL '30 days'
         ORDER BY created_at DESC
