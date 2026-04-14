@@ -162,13 +162,39 @@ def fetch_records(query: str) -> list[dict]:
         return MOCK_RECORDS
 
     log.info("Connecting to database …")
-    with psycopg2.connect(**DB_CONFIG) as conn:
-        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            log.info("Executing query: %s", query)
-            cur.execute(query)
-            rows = [dict(row) for row in cur.fetchall()]
-    log.info("Fetched %d records", len(rows))
-    return rows
+    try:
+        with psycopg2.connect(**DB_CONFIG) as conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                log.info("Executing query: %s", query)
+                cur.execute(query)
+                rows = [dict(row) for row in cur.fetchall()]
+        log.info("Fetched %d records", len(rows))
+        return rows
+    except psycopg2.OperationalError as exc:
+        log.error("Database connection failed: %s", exc)
+        raise
+    except psycopg2.Error as exc:
+        log.error("Database query failed: %s", exc)
+        raise
+
+
+def query_by_tag(tag: str) -> list[dict]:
+    """Fetch users by a JSONB metadata tag — demonstrates NoSQL-style querying."""
+    log.info("Querying users with tag '%s' …", tag)
+    try:
+        with psycopg2.connect(**DB_CONFIG) as conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute(
+                    "SELECT id, name, subscription_plan, metadata->'scores' AS scores "
+                    "FROM users WHERE metadata->'tags' ? %s ORDER BY id",
+                    (tag,)
+                )
+                rows = [dict(row) for row in cur.fetchall()]
+        log.info("Found %d users with tag '%s'", len(rows), tag)
+        return rows
+    except psycopg2.Error as exc:
+        log.error("JSONB tag query failed: %s", exc)
+        raise
 
 
 # ---------------------------------------------------------------------------
@@ -335,6 +361,22 @@ def main():
 
     # Summary report
     total = len(records)
+
+    # Metadata stats from JSONB field
+    plan_counts = {}
+    verified_count = 0
+    avg_engagement = 0.0
+    for r in records:
+        plan = r.get("subscription_plan", "unknown")
+        plan_counts[plan] = plan_counts.get(plan, 0) + 1
+        if r.get("is_verified"):
+            verified_count += 1
+        meta = r.get("metadata") or {}
+        if isinstance(meta, str):
+            meta = json.loads(meta)
+        avg_engagement += float((meta.get("scores") or {}).get("engagement", 0))
+    avg_engagement = avg_engagement / total if total else 0
+
     print("\n" + "=" * 50)
     print("PIPELINE SUMMARY REPORT")
     print("=" * 50)
@@ -345,6 +387,13 @@ def main():
     print(f"  Redis failures       : {total - redis_success}")
     overall = "SUCCESS" if kafka_success == total and redis_success == total else "PARTIAL / FAILED"
     print(f"  Overall status       : {overall}")
+    print("=" * 50)
+    print("METADATA INSIGHTS")
+    print("=" * 50)
+    print(f"  Verified users       : {verified_count}/{total} ({verified_count/total*100:.1f}%)")
+    print(f"  Avg engagement score : {avg_engagement:.2f}/10")
+    for plan, count in sorted(plan_counts.items()):
+        print(f"  Plan [{plan:<12}]: {count} users")
     print("=" * 50 + "\n")
     log.info("Pipeline complete")
 
