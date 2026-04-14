@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(brew install:*)",
+      "Read(//usr/local/Cellar/**)",
+      "Bash(psql --version)",
+      "Read(//usr/local/var/homebrew/locks/**)",
+      "Bash(pg_isready)",
+      "Bash(brew services:*)"
+    ]
+  }
+}
