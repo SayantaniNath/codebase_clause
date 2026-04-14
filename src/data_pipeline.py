@@ -8,7 +8,11 @@ Requirements:
 
 import json
 import logging
+import os
 import time
+from dotenv import load_dotenv
+
+load_dotenv()
 import psycopg2
 import psycopg2.extras
 import redis
@@ -19,18 +23,18 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 log = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Configuration — replace with your actual connection details
+# Configuration — reads from environment variables (set via .env or shell)
 # ---------------------------------------------------------------------------
 DB_CONFIG = {
-    "host": "localhost",
-    "port": 5432,
-    "dbname": "mydb",
-    "user": "myuser",
-    "password": "mypassword",
+    "host": os.environ.get("DB_HOST", "localhost"),
+    "port": int(os.environ.get("DB_PORT", 5432)),
+    "dbname": os.environ.get("DB_NAME", "mydb"),
+    "user": os.environ.get("DB_USER", "myuser"),
+    "password": os.environ.get("DB_PASSWORD", "mypassword"),
 }
 
 KAFKA_CONFIG = {
-    "bootstrap.servers": "localhost:9092",
+    "bootstrap.servers": os.environ.get("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092"),
 }
 
 KAFKA_TOPIC = "comsumption-pipeline-events"
@@ -38,9 +42,9 @@ KAFKA_TOPIC_PARTITIONS = 3
 KAFKA_TOPIC_REPLICATION = 1
 
 REDIS_CONFIG = {
-    "host": "localhost",
-    "port": 6379,
-    "db": 0,
+    "host": os.environ.get("REDIS_HOST", "localhost"),
+    "port": int(os.environ.get("REDIS_PORT", 6379)),
+    "db": int(os.environ.get("REDIS_DB", 0)),
     "decode_responses": True,
 }
 
@@ -74,9 +78,18 @@ def _generate_mock_records(n: int = 100) -> list[dict]:
         "Austin", "Jacksonville", "Denver", "Seattle", "Boston",
     ]
     countries = ["US", "CA", "GB", "AU", "DE", "FR", "IN", "BR", "MX", "JP"]
+    timezones = [
+        "America/New_York", "America/Chicago", "America/Denver", "America/Los_Angeles",
+        "Europe/London", "Europe/Berlin", "Asia/Tokyo", "Asia/Kolkata",
+        "Australia/Sydney", "America/Sao_Paulo",
+    ]
     statuses = ["active", "active", "active", "inactive", "pending"]
     plans = ["free", "basic", "pro", "enterprise"]
+    plan_spend = {"free": 0.0, "basic": 9.99, "pro": 29.99, "enterprise": 99.99}
     domains = ["gmail.com", "yahoo.com", "outlook.com", "example.com", "company.io"]
+    referral_sources = ["organic", "social", "email", "paid_search", "referral", "direct"]
+    device_types = ["mobile", "desktop", "tablet"]
+    browsers = ["Chrome", "Safari", "Firefox", "Edge"]
 
     base_dt = datetime(2026, 4, 13, 0, 0, 0)
     records = []
@@ -86,7 +99,10 @@ def _generate_mock_records(n: int = 100) -> list[dict]:
         name = f"{first} {last}"
         email = f"{first.lower()}.{last.lower()}{random.randint(1, 99)}@{random.choice(domains)}"
         phone = f"+1-{random.randint(200,999)}-{random.randint(100,999)}-{random.randint(1000,9999)}"
-        created_at = base_dt - timedelta(minutes=random.randint(0, 43200))  # within last 30 days
+        created_at = base_dt - timedelta(minutes=random.randint(0, 43200))
+        login_count = random.randint(0, 500)
+        last_login = created_at + timedelta(minutes=random.randint(1, 20000)) if login_count > 0 else None
+        plan = random.choice(plans)
         records.append({
             "id": i,
             "name": name,
@@ -95,9 +111,17 @@ def _generate_mock_records(n: int = 100) -> list[dict]:
             "age": random.randint(18, 72),
             "city": random.choice(cities),
             "country": random.choice(countries),
+            "timezone": random.choice(timezones),
             "status": random.choice(statuses),
-            "subscription_plan": random.choice(plans),
-            "login_count": random.randint(0, 500),
+            "is_verified": random.random() > 0.2,
+            "two_factor_enabled": random.random() > 0.6,
+            "subscription_plan": plan,
+            "monthly_spend": round(plan_spend[plan] * random.uniform(0.8, 1.2), 2),
+            "login_count": login_count,
+            "last_login": last_login.strftime("%Y-%m-%d %H:%M:%S") if last_login else None,
+            "referral_source": random.choice(referral_sources),
+            "device_type": random.choice(device_types),
+            "browser": random.choice(browsers),
             "created_at": created_at.strftime("%Y-%m-%d %H:%M:%S"),
         })
     return records
@@ -258,10 +282,12 @@ def write_to_redis(records: list[dict], key_prefix: str, ttl: int) -> int:
 # ---------------------------------------------------------------------------
 def main():
     query = """
-        SELECT id, name, email, phone, age, city, country,
-               status, subscription_plan, login_count, created_at
+        SELECT id, name, email, phone, age, city, country, timezone,
+               status, is_verified, two_factor_enabled, subscription_plan,
+               monthly_spend, login_count, last_login, referral_source,
+               device_type, browser, created_at
         FROM users
-        WHERE created_at >= NOW() - INTERVAL '1 day'
+        WHERE created_at >= NOW() - INTERVAL '30 days'
         ORDER BY created_at DESC
         LIMIT 1000
     """
