@@ -11,4 +11,4 @@ dist/
 # Editor & Tools
 .claude/
 .vscode/
-\n*.session.sql
+*.session.sql
