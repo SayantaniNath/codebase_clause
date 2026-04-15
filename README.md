@@ -1,13 +1,96 @@
 # Data Pipeline
 
-Reads user records from PostgreSQL, publishes them to a Kafka topic, and caches them in Redis.
+A production-style data pipeline that reads user records from PostgreSQL, publishes them as events to Apache Kafka, and caches them in Redis — with JSONB NoSQL support for flexible metadata querying.
+
+## Tech Stack
+
+### PostgreSQL — Source Database
+- **Role:** Stores 100 user records with 19 structured fields + a `metadata` JSONB column
+- **Why:** Reliable, ACID-compliant, and supports both relational SQL and NoSQL-style JSONB queries
+- **Library:** `psycopg2-binary`
+- **Key feature:** JSONB column enables MongoDB-style queries:
+  ```sql
+  SELECT name FROM users WHERE metadata->'tags' ? 'vip';
+  SELECT name FROM users WHERE (metadata->'scores'->>'engagement')::float > 9.0;
+  ```
+
+### Apache Kafka — Message Broker
+- **Role:** Receives user records as JSON events on the `comsumption-pipeline-events` topic
+- **Why:** Decouples data producers from consumers, handles high-volume event streams
+- **Library:** `confluent-kafka`
+- **Key feature:** Retry logic with exponential backoff on publish failures
+
+### Apache Zookeeper — Kafka Coordinator
+- **Role:** Manages Kafka broker metadata and leader election
+- **Why:** Required by Kafka for distributed coordination
+- **Runs as:** Docker container
+
+### Redis — Cache Layer
+- **Role:** Caches user records as hashes with a 1-hour TTL for fast lookups
+- **Why:** Sub-millisecond reads, ideal for caching frequently accessed data
+- **Library:** `redis`
+- **Key feature:** Pipeline batch writes for performance (`user:1`, `user:2`, ...)
+
+### Python — Pipeline Language
+- **Version:** 3.10+
+- **Why:** Simple, readable, rich ecosystem for data engineering
+
+| Library | Purpose |
+|---|---|
+| `psycopg2-binary` | Connect to PostgreSQL |
+| `confluent-kafka` | Publish messages to Kafka |
+| `redis` | Write and cache records in Redis |
+| `python-dotenv` | Auto-load `.env` config |
+
+### Docker — Local Service Orchestration
+- **Role:** Runs Kafka, Zookeeper, and Redis as containers
+- **Why:** Consistent, reproducible local development environment
+- **Key file:** `docker-compose.yml` — one command starts all services
+
+### GitHub — Version Control
+- **Role:** Hosts the codebase, tracks changes via commits and pull requests
+- **Workflow:** Feature branches → PR → merge to main
+
+---
 
 ## Architecture
 
 ```
-PostgreSQL ──► fetch_records ──► publish_to_kafka ──► Kafka
-                                └──► write_to_redis ──► Redis
+┌─────────────┐     SQL query      ┌─────────────┐
+│  PostgreSQL │ ─────────────────► │   Python    │
+│  (source)   │   fetch records    │  Pipeline   │
+└─────────────┘                    └──────┬──────┘
+                                          │
+                         ┌────────────────┴─────────────────┐
+                         ▼                                   ▼
+                  ┌─────────────┐                   ┌──────────────┐
+                  │    Kafka    │                   │    Redis     │
+                  │  (events)   │                   │   (cache)    │
+                  └─────────────┘                   └──────────────┘
 ```
+
+### Data Flow
+
+```
+PostgreSQL row
+    │
+    ▼
+Python dict (19 fields + JSONB metadata)
+    │
+    ├──► JSON string ──► Kafka message  (key = user id)
+    │
+    └──► Redis hash  ──► key: user:1, user:2 ... (TTL 3600s)
+```
+
+### Pipeline Steps
+
+1. **Fetch** — Connect to PostgreSQL, run SQL query, retrieve user records
+2. **Create Topic** — Ensure Kafka topic exists (idempotent)
+3. **Publish** — Serialize each record to JSON and publish to Kafka
+4. **Cache** — Write records to Redis as hashes with 1hr TTL
+5. **Report** — Print summary with success rates and metadata insights
+
+---
 
 ## Project Structure
 
@@ -27,10 +110,7 @@ PostgreSQL ──► fetch_records ──► publish_to_kafka ──► Kafka
 └── requirements-dev.txt     # Dev/test dependencies
 ```
 
-## Prerequisites
-
-- Python 3.10+
-- Docker (for running services locally)
+---
 
 ## Quick Start
 
@@ -52,6 +132,8 @@ docker-compose up -d
 python src/data_pipeline.py
 ```
 
+---
+
 ## Environment Variables
 
 All configuration is via environment variables. Copy `.env.example` to `.env` and adjust:
@@ -67,6 +149,8 @@ All configuration is via environment variables. Copy `.env.example` to `.env` an
 | `REDIS_HOST` | `localhost` | Redis host |
 | `REDIS_PORT` | `6379` | Redis port |
 | `REDIS_DB` | `0` | Redis database index |
+
+---
 
 ## User Record Fields
 
@@ -92,7 +176,25 @@ Each record fetched from PostgreSQL and published to Kafka contains:
 | `referral_source` | str | Acquisition channel |
 | `device_type` | str | `mobile`, `desktop`, or `tablet` |
 | `browser` | str | Browser name |
+| `metadata` | JSONB | Nested JSON: preferences, tags, scores, last_purchase |
 | `created_at` | timestamp | Account creation time |
+
+### JSONB Metadata Structure
+
+```json
+{
+  "preferences": {
+    "theme": "dark",
+    "language": "en",
+    "notifications": { "email": true, "sms": false, "push": true }
+  },
+  "tags": ["vip", "premium"],
+  "scores": { "engagement": 9.74, "retention": 7.2, "satisfaction": 8.1 },
+  "last_purchase": { "amount": 149.99, "currency": "USD", "days_ago": 12 }
+}
+```
+
+---
 
 ## Make Commands
 
@@ -107,15 +209,7 @@ make up           # Start Docker services
 make down         # Stop Docker services
 ```
 
-## Mock Mode
-
-To run without any live services, set `USE_MOCK_DATA = True` in `src/data_pipeline.py`:
-
-```bash
-make run-mock
-```
-
-This generates 100 realistic user records locally and simulates Kafka/Redis writes.
+---
 
 ## Output
 
@@ -123,14 +217,25 @@ This generates 100 realistic user records locally and simulates Kafka/Redis writ
 ==================================================
 PIPELINE SUMMARY REPORT
 ==================================================
-  Records fetched      : 98
-  Kafka published      : 98/98  (100.0%)
-  Redis written        : 98/98  (100.0%)
+  Records fetched      : 93
+  Kafka published      : 93/93  (100.0%)
+  Redis written        : 93/93  (100.0%)
   Kafka failures       : 0
   Redis failures       : 0
   Overall status       : SUCCESS
 ==================================================
+METADATA INSIGHTS
+==================================================
+  Verified users       : 82/93 (88.2%)
+  Avg engagement score : 5.17/10
+  Plan [basic        ]: 21 users
+  Plan [enterprise   ]: 25 users
+  Plan [free         ]: 21 users
+  Plan [pro          ]: 26 users
+==================================================
 ```
+
+---
 
 ## Development
 
