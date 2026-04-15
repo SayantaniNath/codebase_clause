@@ -2,3 +2,6 @@ psycopg2-binary>=2.9,<3.0
 confluent-kafka>=2.3,<3.0
 redis>=5.0,<8.0
 python-dotenv>=1.0,<2.0
+strawberry-graphql[fastapi]>=0.200,<1.0
+fastapi>=0.100,<1.0
+uvicorn>=0.23,<1.0
