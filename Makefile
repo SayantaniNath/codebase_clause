@@ -1,4 +1,4 @@
-.PHONY: install install-dev run run-mock test lint up down
+.PHONY: install install-dev producer consumer api test lint up down
 
 install:
 	pip install -r requirements.txt
@@ -6,11 +6,17 @@ install:
 install-dev:
 	pip install -r requirements-dev.txt
 
-run:
-	python src/data_pipeline.py
+# Run the producer — reads from PostgreSQL and publishes to Kafka
+producer:
+	python src/producer.py
 
-run-mock:
-	USE_MOCK_DATA=true python src/data_pipeline.py
+# Run the consumer — reads from Kafka and writes to Redis
+consumer:
+	python src/consumer.py
+
+# Run the GraphQL API — serves data from Redis to consumers
+api:
+	uvicorn src.api:app --reload --port 8000
 
 test:
 	pytest tests/ -v
