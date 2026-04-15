@@ -1,9 +1,14 @@
+# Credentials    
 .env
+#python
 __pycache__/
 *.pyc
 *.pyo
 .pytest_cache/
+# Build
 dist/
 *.egg-info/
+# Editor & Tools
 .claude/
-.vscode/\n*.session.sql
+.vscode/
+*.session.sql
