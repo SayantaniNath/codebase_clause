@@ -1,0 +1,1536 @@
+═══════════════════════════════════════════════════════════════════════════════
+                      DATA ENGINEER INTERVIEW PREP GUIDE
+═══════════════════════════════════════════════════════════════════════════════
+
+Covers all three rounds from the technical interview. Each answer is structured
+for 2–3 minute delivery and includes code examples, architecture diagrams, and
+real-world tactics.
+
+═══════════════════════════════════════════════════════════════════════════════
+ROUND 1 — TECHNICAL
+═══════════════════════════════════════════════════════════════════════════════
+
+Q1. How would you design a real-time data pipeline to process millions of
+    financial transactions for fraud detection?
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ARCHITECTURE (draw this on a whiteboard):
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Transactions ──► Kafka (partitioned by account_id)
+                      │
+                      ├─► Spark Structured Streaming / Flink
+                      │
+                      ├─ Rule Engine  ──┐
+                      │ (velocity,     │
+                      │  geo, device,  ├─► Risk Score
+                      │  amount)       │
+                      │                │
+                      └─ ML Scorer ────┘
+                        (XGBoost/
+                         LightGBM)
+
+                      ┌────────────────────────┐
+                      │    DECISION LOGIC      │
+                      │  apply risk threshold  │
+                      └────────────────────────┘
+
+                      ├─► HIGH_RISK           ├─► LOW_RISK
+                      │   Kafka alert topic   │   Cassandra
+                      │   │                   │
+                      └──► Alert service      └──► Write cache
+                           │
+                           └──► Human review queue
+
+KEY DESIGN DECISIONS:
+
+1. INGESTION
+   • Kafka partitioned by account_id
+   • Ensures all transactions for one account land on same partition
+   • Allows consistent ordering for velocity-based fraud rules
+   • Example: "5 transactions in 1 minute" = likely fraud
+
+2. FEATURE STORE
+   • Redis holds rolling counters (transactions in last 1/5/60 minutes)
+   • Stream processor increments counters atomically using INCR + TTL
+   • Provides <1ms lookups for velocity checks
+
+3. DUAL-LAYER DETECTION
+
+   Rule Engine (Deterministic, <1ms):
+   ├─ Velocity: N transactions in last T seconds
+   ├─ Geo-distance: Impossible to travel between locations in time
+   ├─ Known fraud devices: fingerprints, VPNs
+   └─ Velocity consistency: changes in normal spending pattern
+
+   ML Model (Probabilistic, <10ms):
+   ├─ Trained on labelled fraud cases (XGBoost, LightGBM)
+   ├─ Inputs: account features, merchant data, customer history
+   └─ Outputs: probability score 0–1
+
+4. DECISION
+   • Combine rule + ML scores with weighted formula
+   • Example: final_score = 0.4×rules + 0.6×model
+   • Apply threshold: <0.3 ALLOW, 0.3–0.7 REVIEW, >0.7 BLOCK
+
+5. FEEDBACK LOOP
+   • Analyst decisions (ALLOW/BLOCK) flow to labelled dataset
+   • Model retrained weekly with new ground truth
+   • Prevents model drift; improves accuracy over time
+
+6. LATENCY TARGET
+   • <100ms end-to-end (Kafka offset to decision)
+   • Required for real-time card authorization systems
+   • Kafka tuning: batch.size=16KB, linger.ms=10
+
+HOW THIS PROJECT DEMONSTRATES IT:
+───────────────────────────────────
+
+   src/fraud_detector.py
+   ├─ Rules: 7 behavioural signals (unverified spend, no-2FA, etc.)
+   ├─ Scoring: returns 0–100 risk score
+   └─ Risk tiers: CLEAN (0–30), SUSPICIOUS (31–60), HIGH_RISK (61+)
+
+   src/consumer.py
+   └─ Runs fraud_detector.score_record() inline on every Kafka message
+     (before writing to Redis)
+
+   src/api.py
+   └─ GraphQL queries:
+      ├─ getHighRiskUsers() — for review queue
+      ├─ getSuspiciousUsers() — for monitoring
+      └─ getFraudResult(user_id) — single user lookup
+
+═══════════════════════════════════════════════════════════════════════════════
+
+Q2. How do you guarantee data consistency between production OLTP and warehouse?
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+STRATEGY:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+1. CDC WITH DEBEZIUM + KAFKA
+
+   PostgreSQL (production)
+   ├─ Write-Ahead Log (WAL)
+   │  └─ Contains every INSERT/UPDATE/DELETE
+   │
+   └─► Debezium (captures changes)
+       ├─ Polls WAL in real-time
+       ├─ Converts each change to Kafka event
+       └─ Schema: {op: "insert|update|delete", before, after, ts}
+
+       └─► Kafka Topic (immutable event log)
+           ├─ No polling required
+           ├─ Every row change captured
+           └─ Retention: 7 days minimum
+
+2. EXACTLY-ONCE SEMANTICS
+
+   Prevention of duplicates:
+   ┌─────────────────────────────────────────┐
+   │ Kafka transactions (atomic delivery)    │
+   │ Consumer commits offset only after      │
+   │ successful warehouse write              │
+   └─────────────────────────────────────────┘
+
+   Warehouse upsert (idempotent):
+   ```sql
+   INSERT INTO users (id, name, email)
+   VALUES (...)
+   ON CONFLICT (id)
+   DO UPDATE SET
+     name = EXCLUDED.name,
+     email = EXCLUDED.email
+   ```
+
+3. SCHEMA REGISTRY
+
+   Avro schemas stored in Confluent Schema Registry
+   ├─ Enforces schema compatibility before data breaks
+   ├─ Backward compatible: old consumers read new messages ✓
+   ├─ Forward compatible: new consumers read old messages ✓
+   └─ Breaks: removing mandatory fields, changing field types ✗
+
+4. RECONCILIATION JOBS
+
+   Nightly validation (Spark job):
+   ├─ Compare row counts: PostgreSQL vs Warehouse
+   ├─ Compare checksums: hash(id + all columns)
+   ├─ Alert if discrepancy > 0.01%
+   └─ Replay failed records via dead-letter queue
+
+5. SLA MONITORING
+
+   Replication lag metric:
+   ├─ Kafka consumer offset lag (how far behind?)
+   ├─ Target: <5 minutes
+   ├─ Alert if lag > 15 minutes
+   └─ Escalate if lag > 1 hour
+
+COMMON FAILURE MODES & MITIGATIONS:
+───────────────────────────────────
+
+   Failure: Network partition
+   Mitigation: Kafka retention ≥7 days; consumer replays from
+               last committed offset when reconnected
+
+   Failure: Schema change (remove mandatory column)
+   Mitigation: Schema Registry rejects breaking changes; enforces
+               version bump; producers + consumers coordinate
+
+   Failure: Warehouse write failure (disk full, constraint violated)
+   Mitigation: Dead-letter queue captures failed messages; replay
+               job processes them once underlying issue fixed
+
+   Failure: Clock skew (server times drift apart)
+   Mitigation: Use source database timestamps, not consumer
+               timestamps; prefer immutable event_time field
+
+═══════════════════════════════════════════════════════════════════════════════
+
+Q3. You've discovered duplicate records in critical production dataset.
+    Walk through your plan.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+IMMEDIATE (first 30 minutes):
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+1. QUANTIFY SCOPE
+
+   SQL: Find duplicates
+   ───────────────────────────────────────────────────────────────
+   SELECT business_key, COUNT(*) AS cnt
+   FROM orders
+   GROUP BY business_key
+   HAVING COUNT(*) > 1
+   ORDER BY cnt DESC
+   ───────────────────────────────────────────────────────────────
+
+   Answers to determine:
+   ├─ How many duplicates? (100 rows? 1M rows?)
+   ├─ Which tables affected? (just orders? also order_items?)
+   ├─ Which date range? (last 1 day? last month?)
+   ├─ What's the business key? (order_id? order_id + vendor_id?)
+   └─ Are duplicates exact matches or partial (same ID, different amounts)?
+
+2. CREATE AUDIT SNAPSHOT (do NOT delete yet)
+
+   SQL:
+   ───────────────────────────────────────────────────────────────
+   CREATE TABLE orders_duplicate_audit AS
+   SELECT * FROM orders
+   WHERE business_key IN (
+     SELECT business_key FROM orders
+     GROUP BY business_key HAVING COUNT(*) > 1
+   );
+   ───────────────────────────────────────────────────────────────
+
+   Why: Legal/compliance requirement; allows rollback if dedup logic wrong
+
+3. ASSESS DOWNSTREAM IMPACT
+
+   Questions:
+   ├─ Which dashboards/reports consume this table?
+   ├─ Are duplicate rows inflating revenue/count metrics?
+   ├─ Have alerts/SLAs already fired?
+   ├─ Are downstream systems depending on uniqueness (referential integrity)?
+   └─ How many stakeholders need notifying?
+
+4. COMMUNICATE STATUS
+
+   Slack message template:
+   ─────────────────────────────────────────────────────────────
+   🚨 INCIDENT: Duplicate records detected in orders table
+
+   Scope: 10,000 duplicate rows (0.5% of total)
+   Period: Last 2 days
+   Impact: Revenue metrics overstated by ~$5M
+
+   Status: Under investigation; deduplication plan being finalized
+   Next update: 10:30 AM
+   ─────────────────────────────────────────────────────────────
+
+DEDUPLICATION (careful, deliberate):
+───────────────────────────────────
+
+   SQL: Keep most recent per business key
+   ───────────────────────────────────────────────────────────────
+   DELETE FROM orders
+   WHERE id NOT IN (
+     SELECT DISTINCT ON (business_key) id
+     FROM orders
+     ORDER BY business_key, created_at DESC
+   );
+   ───────────────────────────────────────────────────────────────
+
+   Why DISTINCT ON?
+   ├─ For each business_key, pick the row with latest created_at
+   ├─ Delete all others
+   └─ Assumes "latest record is most correct"
+
+   Safety checks BEFORE executing DELETE:
+   ├─ [ ] Test DELETE on a copy of the table
+   ├─ [ ] Verify row counts before/after
+   ├─ [ ] Get approval from data owner
+   ├─ [ ] Have backup/rollback plan
+   └─ [ ] Schedule during low-traffic window
+
+LONG-TERM PREVENTION:
+────────────────────
+
+   Layer              Fix
+   ───────────────────────────────────────────────────────────
+   Database           Add UNIQUE constraint on business_key
+                      ├─ Enforced at insert time
+                      └─ Rejects duplicates automatically
+
+   Pipeline           Use idempotent upsert:
+                      INSERT ... ON CONFLICT (business_key) DO UPDATE
+                      └─ Retries no longer cause duplicates
+
+   Kafka consumer     Maintain "seen" set in Redis
+                      ├─ Check if message_id already processed
+                      └─ Skip if yes; process if no
+
+   Data quality       Great Expectations / dbt tests
+                      ├─ Run after every pipeline load
+                      ├─ Assert uniqueness on business_key
+                      └─ Fail loudly; prevent bad data from propagating
+
+═══════════════════════════════════════════════════════════════════════════════
+
+Q4. Producer team pushing schema change that breaks your pipeline.
+    How do you manage this?
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PREVENTION (before the break):
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+1. SCHEMA REGISTRY
+
+   Every schema change must pass compatibility check:
+
+   Backward compatible ✓
+   ├─ Producer adds new OPTIONAL field "user_phone"
+   ├─ Old consumer ignores new field; still works
+   └─ Use this for forward-facing schema changes
+
+   Full compatible ✓
+   ├─ Both old and new consumers can read both old and new messages
+   └─ Allows simultaneous deployment of producer + consumers
+
+   Breaking ✗
+   ├─ Producer REMOVES mandatory field "user_id"
+   ├─ Old consumer crashes (field missing)
+   ├─ Requires coordinated deployment; communication required
+   └─ Schema Registry blocks by default
+
+2. CONTRACT TESTING
+
+   Consumer team publishes contract (Pact tests):
+   ───────────────────────────────────────────────────────────────
+   # Consumer contract
+   Given a user event with fields (id, name, email)
+   When I deserialize the event
+   Then I should extract (id, name, email) successfully
+
+   And the JSON should validate against consumer schema
+   ───────────────────────────────────────────────────────────────
+
+   Producer CI runs contract test before merge:
+   ├─ If schema change breaks contract → CI fails → code rejected
+   ├─ Prevents surprises at runtime
+   └─ Communication happens during code review, not in prod
+
+IF YOU GET SURPRISE NOTICE OF BREAKING CHANGE:
+───────────────────────────────────────────────
+
+1. Negotiate transition window (2–4 weeks ideal)
+   └─ Rarely possible in real world; expect 1–2 weeks minimum
+
+2. DUAL-PUBLISH strategy
+
+   Producer logic:
+   ├─ Write to old_topic (old schema)  ← old consumer reads
+   ├─ Write to new_topic (new schema)  ← new consumer reads
+   └─ Run both for 2 weeks (transition window)
+
+   Consumer migration:
+   ├─ Switch from old_topic → new_topic
+   ├─ Verify correctness in new_topic (shadow traffic)
+   └─ Once confident, deprecate old_topic
+
+3. DEFENSIVE CODING IN CONSUMER
+
+   ❌ Bad (crashes if field missing):
+   ───────────────────────────────────────────────────────────────
+   user_phone = record["phone"]
+   ───────────────────────────────────────────────────────────────
+
+   ✓ Good (uses default if missing):
+   ───────────────────────────────────────────────────────────────
+   user_phone = record.get("phone", default_value)
+   ───────────────────────────────────────────────────────────────
+
+IF YOU INHERIT BROKEN PIPELINE:
+───────────────────────────
+
+1. STOP consumer (prevent bad data propagation)
+2. DETERMINE offset where schema changed
+   ├─ Review Kafka broker logs
+   └─ Identify commit timestamp of breaking deployment
+
+3. WRITE migration script
+   ───────────────────────────────────────────────────────────────
+   def transform_record(msg):
+       # Handle both old and new schema
+       if "new_field" in msg:
+           # New schema
+           return {...}
+       else:
+           # Old schema + backfill
+           return {..., "new_field": default_value}
+   ───────────────────────────────────────────────────────────────
+
+4. REPLAY from breaking offset
+   ├─ Reset consumer offset to just before schema change
+   ├─ Apply migration function to every message
+   └─ Write transformed records to new location
+
+═══════════════════════════════════════════════════════════════════════════════
+
+Q5. Spark job runs 10× slower in production than testing.
+    Systematic debugging approach?
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+STEP-BY-STEP DIAGNOSIS:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+1. OPEN SPARK UI (:4040)
+
+   What to look for:
+   ├─ Stage timeline: which stage takes longest?
+   ├─ Task distribution: are task durations uniform?
+   ├─ Shuffle read/write: how much data moved between partitions?
+   └─ GC time: percentage of time spent in garbage collection
+
+2. DATA SKEW CHECK
+
+   Symptom: One task takes 10× longer than others in same stage
+
+   Python:
+   ───────────────────────────────────────────────────────────────
+   # Check partition sizes
+   sizes = df.rdd.mapPartitions(lambda it: [sum(1 for _ in it)]).collect()
+   print(f"Min: {min(sizes)}, Max: {max(sizes)}, Median: {sorted(sizes)[len(sizes)//2]}")
+
+   # If max > 100x median, you have skew
+   ───────────────────────────────────────────────────────────────
+
+   Fix: SALTING (for joins with hot keys)
+   ───────────────────────────────────────────────────────────────
+   from pyspark.sql.functions import rand, concat, lit
+
+   df = df.withColumn("salt", (rand() * 10).cast("int"))
+   df = df.withColumn("salted_key", concat(col("join_key"), lit("_"), col("salt")))
+
+   result = df.join(df2, [df.salted_key == df2.salted_key])
+   ───────────────────────────────────────────────────────────────
+
+   Why: Splits hot key into 10 sub-keys; distributes evenly across executors
+
+3. SHUFFLE READ/WRITE
+
+   Symptom: Exchange nodes in query plan; shuffle MB in logs
+
+   Fix: BROADCAST SMALLER SIDE
+   ───────────────────────────────────────────────────────────────
+   from pyspark.sql.functions import broadcast
+
+   # If small_df < 2GB, broadcast it to every executor
+   result = large_df.join(broadcast(small_df), "id")
+   ───────────────────────────────────────────────────────────────
+
+   Why: Eliminates expensive shuffle; small_df sent once to each executor
+
+4. GARBAGE COLLECTION PRESSURE
+
+   Symptom: Spark UI shows >10% of executor time in GC
+
+   Causes:
+   ├─ Too many objects created → heap fills
+   ├─ Large object accumulation (dataframes, broadcasts)
+   └─ Executors fighting for memory
+
+   Fix options (in order of preference):
+   ├─ 1. Increase executor memory (-Xmx flag)
+   ├─ 2. Use G1GC: spark.executor.extraJavaOptions="-XX:+UseG1GC"
+   ├─ 3. Enable off-heap memory (Tungsten format)
+   └─ 4. Reduce shuffle size (filter earlier, prune columns)
+
+5. INPUT DATA VOLUME
+
+   Test: 100GB  vs  Production: 1TB (10× larger)
+
+   Check:
+   ├─ Number of input files: ls -l /data/input/
+   ├─ Partition sizes: target 128–256 MB per partition
+   ├─ If <128MB partitions → too many small files → overhead
+   └─ If >1GB partitions → parallelism limited
+
+   Fix:
+   ───────────────────────────────────────────────────────────────
+   # Repartition to target size
+   df.repartition(num_partitions=1000).write.parquet(path)
+   ───────────────────────────────────────────────────────────────
+
+6. EXTERNAL I/O BOTTLENECK
+
+   Slow reads from S3/HDFS:
+   ├─ Check S3 request metrics (CloudWatch)
+   ├─ Verify network bandwidth available
+   └─ S3 can throttle if accessing same prefix too fast
+
+   Database connections per task:
+   ├─ Never open connection in UDF! (connection per partition)
+   └─ Use Spark's built-in JDBC reader instead
+
+7. SERIALIZATION OVERHEAD
+
+   Java serialization is slow; Kryo is 10× faster
+
+   Configuration:
+   ───────────────────────────────────────────────────────────────
+   spark.conf.set("spark.serializer", "org.apache.spark.serializer.KryoSerializer")
+   ───────────────────────────────────────────────────────────────
+
+QUICK-WINS CHECKLIST:
+────────────────────
+
+   [ ] Predicate pushdown enabled (filter before join)
+   [ ] Partition by join key before wide transformation
+   [ ] Adaptive Query Execution enabled:
+       spark.sql.adaptive.enabled = true
+   [ ] Table statistics up to date:
+       ANALYZE TABLE users COMPUTE STATISTICS
+   [ ] Broadcast joins on small tables (<2GB)
+   [ ] Avoid SELECT * (column pruning)
+   [ ] Use Kryo serialization
+
+═══════════════════════════════════════════════════════════════════════════════
+ROUND 2 — TECHNICAL (Continued)
+═══════════════════════════════════════════════════════════════════════════════
+
+Q1. Design a system to secure PII in a data lake while allowing access?
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+DEFENCE-IN-DEPTH APPROACH:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+RAW ZONE (encrypted, highly restricted)
+├─ PII fields: name, email, phone, SSN, account_number
+├─ Encryption: AES-256 at-rest
+├─ Key management: AWS KMS (rotation every 90 days)
+├─ Access: DataOps team only (need-to-know)
+└─ Auditing: CloudTrail logs every read
+
+         ↓ Daily ETL (Debezium CDC)
+
+REFINED ZONE (tokenised, semi-structured)
+├─ Token mapping: name → "TOKEN_8374929"
+├─ Vault: HashiCorp Vault stores token↔PII mapping
+├─ Access: Analytics team (read-only)
+├─ Purpose: Remove direct PII from analytics
+└─ Format: Structured (Parquet) for BI tools
+
+         ↓ Aggregation queries
+
+ANALYTICAL ZONE (masked/anonymised)
+├─ Name → "J*** D***" (first char + asterisks)
+├─ Email → "j***@g***.com"
+├─ Phone → "+1-***-***-4567" (last 4 digits)
+├─ Aggregate data: total transactions per user (no individual records)
+└─ Access: All analysts + external partners (safest tier)
+
+ACCESS CONTROL LAYERS:
+─────────────────────
+
+   Storage Layer (File system):
+   ├─ S3 bucket policies: only DataOps IAM role can read raw zone
+   ├─ HDFS ACLs: refined zone readable by analytics users
+   └─ Encryption: S3 server-side encryption (SSE-S3 or SSE-KMS)
+
+   Catalogue Layer (Metadata):
+   ├─ AWS Lake Formation: column-level permissions per role
+   ├─ Apache Ranger: fine-grained ACLs for Hive/Spark
+   └─ Example: analyst_role can read {user_id, token, transaction_amt}
+              but NOT {email, phone}
+
+   Query Layer (Runtime):
+   ├─ Trino / Spark with column masking UDFs
+   ├─ Row-level security: user can only see rows where region = their_region
+   └─ Dynamic masking: query returns masked email regardless of role
+
+   Audit Layer (Compliance):
+   ├─ CloudTrail: logs who queried what, when
+   ├─ Ranger audit log: every query logged
+   └─ Alert: if non-PII analyst queries PII fields → escalate
+
+GDPR COMPLIANCE HOOKS:
+──────────────────────
+
+   Data Subject Deletion ("Right to be Forgotten"):
+   ├─ If user requests deletion:
+   │  1. Delete raw PII from raw zone
+   │  2. Delete token mapping from vault
+   │  3. All derived data (analytics, reports) automatically anonymous
+   │     (because tokens no longer map to PII)
+   └─ Advantage of tokenisation: no need to find/delete all derived copies
+
+   Purpose Limitation:
+   ├─ Tag each column with its purpose
+   │  ├─ email: "marketing_communications"
+   │  ├─ phone: "account_recovery"
+   │  └─ ip_address: "fraud_detection"
+   ├─ Enforce at query time: analytics job declared purpose must match
+   └─ Example: marketing job can read {email, phone}
+              but fraud job cannot read {email, phone}
+
+THIS PROJECT'S APPROACH (src/fraud_detector.py):
+────────────────────────────────────────────────
+
+   PII handling:
+   ├─ Email, phone, name are READ during fraud scoring
+   │  (used to extract features like "unverified account")
+   ├─ But NEVER logged in fraud signals
+   └─ Fraud results contain only: user_id + score + risk_level
+
+   Example:
+   ├─ User ID 42: email=unverified, monthly_spend=$500
+   ├─ Fraud detector: "SUSPICIOUS: unverified + high spend"
+   └─ Redis stores: fraud:42 = {user_id: 42, score: 35, risk: SUSPICIOUS}
+                    (email not stored)
+
+═══════════════════════════════════════════════════════════════════════════════
+
+Q2. Real-time dashboard lagging due to Kafka delays. Troubleshoot?
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SYSTEMATIC DIAGNOSIS:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+1. MEASURE CONSUMER LAG
+
+   Command:
+   ───────────────────────────────────────────────────────────────
+   kafka-consumer-groups.sh --bootstrap-server localhost:9092 \
+     --describe --group dashboard-consumer-group
+   ───────────────────────────────────────────────────────────────
+
+   Output interpretation:
+   GROUP                TOPIC        PARTITION  OFFSET  LOG-END-OFFSET  LAG
+   dashboard-group      events       0          45000   50000           5000
+   dashboard-group      events       1          48000   48001           1
+   dashboard-group      events       2          40000   60000           20000
+
+   Analysis:
+   ├─ Partition 0: lag=5000 messages (moderate)
+   ├─ Partition 1: lag=1 (healthy)
+   ├─ Partition 2: lag=20000 (critical bottleneck!)
+   └─ Action: investigate partition 2's consumer instance
+
+2. IS PRODUCER SLOW OR CONSUMER SLOW?
+
+   Check producer throughput:
+   ├─ Kafka broker metrics: Kafka Manager, Confluent Control Center
+   ├─ Look for: BytesInPerSec, MessagesInPerSec
+   └─ Target: >10,000 messages/sec (typical SLA)
+
+   Check consumer throughput:
+   ├─ Consumer logs: log lines like "Processed N messages"
+   ├─ Kafka metrics: BytesOutPerSec for your consumer group
+   └─ Compare: if producer > consumer → consumer bottleneck ✓
+
+3. CONSUMER BOTTLENECK CAUSES:
+
+   a) Too few consumer instances
+      └─ Max parallelism = number of partitions (3 partitions = max 3 consumers)
+         If you have 1 consumer processing 3 partitions, it's overloaded
+
+      Fix: Add consumer instances
+      ├─ Scale to (partition_count) instances
+      └─ Each instance processes 1 partition in parallel
+
+   b) Message processing logic is slow
+      ├─ Example: write to database for each message
+      └─ <100ms per message × 10,000 msg/s = 1000 seconds = 16+ minutes lag
+
+      Fix: Batch writes
+      ├─ Collect 1000 messages, write once (single DB transaction)
+      └─ Reduces overhead from 100ms → 0.1ms per message
+
+   c) Consumer re-balancing loop
+      ├─ Consumer crashes → Kafka re-balances group → restarts
+      ├─ Repeated crashes = repeated rebalances
+      ├─ Check consumer logs for frequent "Revoking partitions"
+      └─ Root cause: usually GC pauses, OutOfMemory, or bad code
+
+      Fix: Increase session timeout / heartbeat interval
+      ───────────────────────────────────────────────────────────────
+      consumer_config = {
+          'session.timeout.ms': 30000,  # 30s (default 10s)
+          'heartbeat.interval.ms': 3000  # 3s (default 3s)
+      }
+      ───────────────────────────────────────────────────────────────
+
+4. BROKER-SIDE ISSUES:
+
+   High disk I/O:
+   ├─ Messages not replicated fast enough
+   ├─ Check: iostat, iotop on broker servers
+   └─ Fix: scale cluster, or reduce message retention
+
+   Leader election:
+   ├─ Broker crashes → leader election → partition unavailable
+   ├─ Check broker logs for "Election"
+   └─ Causes: network partition, GC pauses, disk full
+
+   Retention limit hit:
+   ├─ Old messages deleted before consumed
+   ├─ Check: log retention (retention.ms default = 7 days)
+   └─ Fix: increase retention for critical topics
+
+5. FIXES (in priority order):
+
+   Fast (< 5 min):
+   ├─ Add consumer instances (if parallelism < partitions)
+   └─ Increase batch size in consumer
+
+   Medium (< 30 min):
+   ├─ Batch database writes (1000 messages → 1 transaction)
+   ├─ Enable compression (producer side, reduces network I/O)
+   └─ Increase partition count (requires topic recreation)
+
+   Slow (> 1 hour):
+   ├─ Refactor consumer logic (move heavy processing off hot path)
+   ├─ Add async enrichment (fetch reference data in background thread)
+   └─ Scale Kafka cluster (add brokers)
+
+═══════════════════════════════════════════════════════════════════════════════
+
+Q3. Emergency action plan if critical pipeline fails at peak hours?
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+INCIDENT RESPONSE PLAYBOOK:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+   DETECT → TRIAGE → CONTAIN → DIAGNOSE → FIX → VERIFY → COMMUNICATE → POST-MORTEM
+
+PHASE BREAKDOWN:
+
+   Phase: DETECT
+   ───────────────────────────────────────────────────────────────
+   Time target: <5 minutes
+   Actions:
+   ├─ PagerDuty alert fires (pipeline health check failed)
+   ├─ On-call engineer acknowledges alert
+   └─ Incident channel created: #incident-pipeline-001
+
+   Responsibility: Monitoring/alerting system
+
+   Phase: TRIAGE
+   ───────────────────────────────────────────────────────────────
+   Time target: <10 minutes
+   Questions to answer:
+   ├─ Is data lost, delayed, or corrupted?
+   ├─ Which tables/topics affected?
+   ├─ How many downstream systems impacted?
+   ├─ What's the revenue/business impact?
+   └─ Is this a hardware failure, code bug, or configuration issue?
+
+   Responsibility: On-call engineer + service owner
+
+   Phase: CONTAIN
+   ───────────────────────────────────────────────────────────────
+   Time target: <15 minutes
+   Actions:
+   ├─ Pause downstream consumers (prevent bad data propagating)
+   ├─ Stop producers from writing corrupted data
+   ├─ Verify Kafka retention is set to ≥24 hours
+   │  (no messages lost during outage recovery)
+   └─ Set up incident war room (Zoom + shared doc)
+
+   Responsibility: Platform oncall
+
+   Key principle: PRESERVE DATA FIRST
+   ├─ Do NOT truncate tables
+   ├─ Do NOT delete Kafka topics
+   └─ Recovery requires replaying from Kafka offset
+
+   Phase: DIAGNOSE
+   ───────────────────────────────────────────────────────────────
+   Time target: <30 minutes
+   Actions:
+   ├─ Check application logs (ERROR/FATAL messages)
+   ├─ Review recent deployments (git log)
+   ├─ Check infrastructure (AWS/GCP console for resource failures)
+   ├─ Verify recent config changes
+   ├─ Check upstream data sources (DB, APIs)
+   └─ Ask: "What changed in the last 30 minutes?"
+
+   Responsibility: On-call engineer + SRE
+
+   Phase: FIX
+   ───────────────────────────────────────────────────────────────
+   Time target: <60 minutes
+   Actions (in priority order):
+
+   Option A: ROLLBACK (safest if cause is code)
+   ├─ Identify last known good deployment (git SHA)
+   ├─ Redeploy previous version
+   ├─ Monitor: does pipeline recover?
+   └─ Time: ~10 minutes
+
+   Option B: HOTFIX (if rollback doesn't work)
+   ├─ Apply targeted fix to current code
+   ├─ Test on staging first (5 minutes)
+   ├─ Deploy to production
+   └─ Time: ~20 minutes
+
+   Option C: MANUAL INTERVENTION (if code is fine)
+   ├─ Example: database max connections reached
+   ├─ Fix: kill idle connections, restart DB connection pool
+   ├─ Time: ~5–15 minutes
+
+   Responsibility: On-call engineer; escalate if stuck >30 min
+
+   Phase: VERIFY
+   ───────────────────────────────────────────────────────────────
+   Time target: +15 minutes after fix
+   Actions:
+   ├─ Confirm pipeline is processing messages (no lag)
+   ├─ Run data reconciliation: count rows, compare checksums
+   ├─ Verify downstream dashboards updated
+   ├─ Check error rates back to normal
+   └─ Get sign-off from service owner
+
+   Responsibility: On-call + data owner
+
+   Phase: COMMUNICATE
+   ───────────────────────────────────────────────────────────────
+   Timing: Every 15–30 minutes during incident
+
+   Update format:
+   ─────────────────────────────────────────────────────────────
+   🚨 UPDATE 10:30 AM
+
+   Status: Pipeline down for 15 minutes
+   Cause: Under investigation (likely code or DB connection)
+   Impact: Reports delayed; no data loss (Kafka retention active)
+   ETA: Next update 10:45 AM
+   ─────────────────────────────────────────────────────────────
+
+   Channels: #incident-channel, leadership email, status page
+   Responsibility: Incident commander (usually TLM or on-call)
+
+   Phase: POST-MORTEM
+   ───────────────────────────────────────────────────────────────
+   Time target: <48 hours after incident
+   Format: Blameless root cause analysis
+
+   Template:
+   ├─ Timeline: exact sequence of events
+   ├─ Root cause: why did it fail? (not "human error")
+   ├─ Contributing factors: what made it worse?
+   ├─ Impact: business metrics affected (revenue, SLA miss)
+   ├─ Remediation: what we did (rollback, hotfix)
+   └─ Prevention: what we change going forward
+
+   Example prevention items:
+   ├─ Add pre-deploy health check (catch issues before prod)
+   ├─ Increase Kafka retention to 48 hours (even more safety)
+   ├─ Add DB connection pool metrics + alerting
+   ├─ Document runbooks for each failure type
+   └─ Train team on new procedures
+
+   Responsibility: Service owner + platform team
+
+KEY PRINCIPLE — PRESERVE DATA FIRST:
+───────────────────────────────────
+
+   ✗ Do NOT: Delete data, truncate tables, reset offsets
+   ✓ Do: Preserve all data; fix downstream processing
+
+   Why? Because you can replay from Kafka offset, but you CANNOT
+        un-delete rows once lost.
+
+ROLLBACK CHECKLIST:
+──────────────────
+
+   [ ] Identify last known good deployment SHA
+   [ ] Verify tests were passing on that commit
+   [ ] Redeploy from that SHA: "git checkout SHA && deploy"
+   [ ] Monitor: is pipeline recovering?
+   [ ] If >5 min with no recovery → try hotfix instead of rollback
+
+═══════════════════════════════════════════════════════════════════════════════
+
+Q4. Manage data partitioning in petabyte-scale dataset; avoid data skew?
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PARTITION KEY SELECTION:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+   Partitioning strategy determines query efficiency & data distribution.
+
+   Key type                Good for                Risk
+   ───────────────────────────────────────────────────────────────
+   Hash(user_id)          Even distribution       No time-based pruning
+
+   Date(year/month/day)   Time-range queries      Hot partition (today)
+
+   Composite(date+region) Both time & geography   Complex queries
+
+   Bucketing              Same-key co-location    Limited to join keys
+
+DETECTING SKEW:
+───────────────
+
+   Python (Spark):
+   ───────────────────────────────────────────────────────────────
+   sizes = df.rdd.mapPartitions(lambda it: [sum(1 for _ in it)]).collect()
+
+   min_size = min(sizes)
+   max_size = max(sizes)
+   median_size = sorted(sizes)[len(sizes)//2]
+
+   skew_ratio = max_size / median_size
+
+   if skew_ratio > 100:
+       print("⚠️  SEVERE SKEW DETECTED")
+   elif skew_ratio > 10:
+       print("⚠️  Moderate skew — consider repartitioning")
+   ───────────────────────────────────────────────────────────────
+
+FIXING SKEW:
+────────────
+
+   Technique 1: SALTING (for aggregations + joins)
+
+   Problem: Hot key (user_id = 999999) has 90% of rows
+   Solution: Randomly split it into N sub-keys
+
+   Python:
+   ───────────────────────────────────────────────────────────────
+   from pyspark.sql.functions import rand, concat, lit
+
+   df = df.withColumn("salt", (rand() * 100).cast("int"))
+   df = df.withColumn(
+       "salted_key",
+       concat(col("user_id"), lit("_"), col("salt"))
+   )
+
+   # Aggregate on salted_key, then combine results
+   result = df.groupBy("salted_key").agg(sum("amount"))
+   ───────────────────────────────────────────────────────────────
+
+   Why: Splits user_id=999999 into 100 sub-keys (999999_0 to 999999_99)
+        Each sub-key gets ~1% of rows → balanced distribution
+
+   Technique 2: REPARTITION BEFORE WRITE
+
+   Python:
+   ───────────────────────────────────────────────────────────────
+   df.repartition(200, "country", "date").write.parquet("/data/events")
+   ───────────────────────────────────────────────────────────────
+
+   Why: Forces Spark to shuffle data by (country, date) before writing
+        Even distribution guaranteed; no skew in output files
+
+   Technique 3: Z-ORDER (Delta Lake)
+
+   SQL:
+   ───────────────────────────────────────────────────────────────
+   -- Organize data for multi-column predicates
+   OPTIMIZE events ZORDER BY (user_id, event_date)
+   ───────────────────────────────────────────────────────────────
+
+   Why: Interleaves values of multiple columns → skips files efficiently
+        Queries on (user_id=X, event_date=Y) read fewer files
+
+   Technique 4: FILE SIZING
+
+   Target: 256 MB – 1 GB per Parquet file
+
+   Too small (<128 MB per file):
+   ├─ Excessive metadata overhead
+   ├─ Too many small files ("small file problem")
+   └─ Fix: Repartition to fewer, larger partitions
+
+   Too large (>2 GB per file):
+   ├─ Limits parallelism during reads
+   └─ Fix: Increase partition count
+
+═══════════════════════════════════════════════════════════════════════════════
+
+Q5. Join two massive datasets too large for memory?
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+TECHNIQUE SELECTION:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+   Situation                           Technique
+   ───────────────────────────────────────────────────────────────
+   One side <2GB                       Broadcast hash join
+   Both sides large, pre-bucketed      Bucket join
+   Both sides large, arbitrary key     Sort-merge join
+   Only approximate results needed     Bloom filter pre-filtering
+   Need low latency + no shuffle       Partitioned storage
+
+JOIN EXECUTION PLANS:
+
+   1. BROADCAST HASH JOIN (fastest; requires small table)
+
+   Precondition: small_df fits in executor memory (<2GB)
+
+   Spark execution:
+   ├─ Collect small_df into memory (all executors)
+   ├─ Build hash table in each executor's memory
+   ├─ Stream large_df, look up matches in hash table
+   └─ No shuffle needed; embarrassingly parallel
+
+   Time: <1 second for most joins
+
+   Python:
+   ───────────────────────────────────────────────────────────────
+   from pyspark.sql.functions import broadcast
+
+   result = large_df.join(
+       broadcast(small_df),  # hint: broadcast small side
+       large_df.user_id == small_df.user_id,
+       "left"
+   )
+   ───────────────────────────────────────────────────────────────
+
+   2. BUCKET JOIN (no shuffle; requires pre-bucketing)
+
+   Precondition: both datasets already bucketed on join key
+
+   Setup (one-time):
+   ───────────────────────────────────────────────────────────────
+   orders_df.write.bucketBy(256, "user_id").parquet("/orders_bucketed")
+   users_df.write.bucketBy(256, "user_id").parquet("/users_bucketed")
+   ───────────────────────────────────────────────────────────────
+
+   Join (at query time, no shuffle):
+   ───────────────────────────────────────────────────────────────
+   orders = spark.read.parquet("/orders_bucketed")
+   users = spark.read.parquet("/users_bucketed")
+
+   result = orders.join(users, "user_id")  # Spark detects bucketing
+   ───────────────────────────────────────────────────────────────
+
+   Why: Both datasets already partitioned identically; matching buckets
+        joined locally on same executor → no shuffle
+
+   3. SORT-MERGE JOIN (default; handles arbitrary join keys)
+
+   Spark execution:
+   ├─ Partition both sides by join key
+   ├─ Sort each partition by join key
+   ├─ Merge sorted partitions (like SQL merge)
+   └─ Output matches in order
+
+   Time: slow due to shuffle + sort, but handles any data size
+
+   Optimization: pre-partition before writing
+   ───────────────────────────────────────────────────────────────
+   # Write both datasets pre-partitioned by join key (one-time cost)
+   orders_df.repartition(200, "user_id") \
+       .write.partitionBy("user_id").parquet("/orders/")
+
+   users_df.repartition(200, "user_id") \
+       .write.partitionBy("user_id").parquet("/users/")
+
+   # At query time, Spark reads matching partitions → no shuffle needed!
+   orders = spark.read.parquet("/orders/")
+   users = spark.read.parquet("/users/")
+
+   result = orders.join(users, "user_id")  # Uses pre-partitioned structure
+   ───────────────────────────────────────────────────────────────
+
+   4. BLOOM FILTER PRE-FILTERING
+
+   Use case: Left dataset is 100x larger; only small % have matches
+
+   Example: Users × Orders where most users have 0 orders
+
+   Algorithm:
+   ├─ Build Bloom filter from users_df (which user_ids exist)
+   ├─ Filter orders_df: keep only orders for known users
+   ├─ Reduces orders from 1M to 10K (90% elimination)
+   └─ Join filtered orders with users (much faster)
+
+   Spark (manual implementation):
+   ───────────────────────────────────────────────────────────────
+   from pyspark.sql.functions import collect_set
+
+   # Build Bloom filter from users
+   user_ids = users_df.rdd.flatMap(lambda x: [x.user_id]).collect()
+   bf = create_bloom_filter(user_ids)  # custom function or library
+
+   # Filter orders before join
+   orders_filtered = orders_df.filter(lambda x: bf.contains(x.user_id))
+
+   result = orders_filtered.join(users_df, "user_id")
+   ───────────────────────────────────────────────────────────────
+
+ADDITIONAL TACTICS:
+───────────────────
+
+   INCREMENTAL JOIN
+   ├─ If only new rows need joining, join only the delta
+   ├─ Example: daily_new_orders join with historical users
+   ├─ Reduces shuffle volume from 1TB → 100GB
+   └─ Requires maintaining "last processed" offset
+
+   COLUMNAR PRUNING
+   ├─ Select only columns needed before the join
+   ├─ Reduces shuffle volume
+   └─ Python: df.select(["user_id", "amount"]).join(...)
+
+   AQE (Adaptive Query Execution)
+   ├─ Spark dynamically switches join strategies at runtime
+   ├─ If broadcast side is smaller than expected → use broadcast
+   ├─ Enable: spark.sql.adaptive.enabled = true
+   └─ Automatically optimizes based on actual data
+
+═══════════════════════════════════════════════════════════════════════════════
+
+Q6. Daily batch job normally 2 hours, now taking 6 hours. Root cause?
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+STRUCTURED INVESTIGATION (broad → narrow):
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+1. INPUT DATA VOLUME
+
+   Has the dataset grown 3×?
+
+   Bash:
+   ───────────────────────────────────────────────────────────────
+   # Compare today vs last week
+   hdfs dfs -du -s /data/input/2024-05-23  # today
+   hdfs dfs -du -s /data/input/2024-05-16  # last week
+   ───────────────────────────────────────────────────────────────
+
+   If today > 3 × last_week → data volume is the culprit
+
+2. RESOURCE CONTENTION
+
+   Is the cluster busier than normal?
+
+   Tools:
+   ├─ YARN Resource Manager (RM) UI → queue utilization
+   ├─ Kubernetes dashboard → pod scheduling delays
+   ├─ Check if other jobs running in parallel
+   └─ Look for: memory contention, CPU throttling, I/O bottlenecks
+
+3. SPARK UI COMPARISON
+
+   Open Spark UIs side-by-side:
+   ├─ Slow run (today) vs fast run (last week)
+   ├─ Which stage is slow? (SQL → Spark → Hadoop)
+   ├─ Are there more tasks than before?
+   └─ Is GC time elevated? (>10% = memory pressure)
+
+4. SHUFFLE EXPLOSION
+
+   An upstream data change can multiply shuffle volume:
+
+   Example:
+   ├─ Old: GROUP BY category (5 categories total)
+   ├─ New: GROUP BY category + subcategory (500 combinations)
+   ├─ Shuffle size: 5× → 500× (100× increase!)
+   └─ Result: 2 hours → 200 hours theoretically
+
+   Fix: Profile shuffle size
+   ───────────────────────────────────────────────────────────────
+   import pyspark.sql.functions as F
+
+   result = df.groupBy("category", "subcategory").agg(...)
+
+   # Check Spark UI stage metrics → shuffle write = shuffle size
+   ───────────────────────────────────────────────────────────────
+
+5. EXTERNAL DEPENDENCY DEGRADATION
+
+   DB connection pool exhausted:
+   ├─ Job tries to read from database
+   ├─ Pool has 10 connections; 20 needed
+   ├─ Waits for available connection → slow
+
+   S3 throttling:
+   ├─ Job reads from S3; AWS throttles
+   ├─ Check CloudWatch metrics: request rate, error rate
+
+   Network latency spike:
+   ├─ Job moved to different region/cloud?
+   └─ Inter-rack latency increased?
+
+6. DATA QUALITY REGRESSION
+
+   Unexpected NULLs or malformed records:
+
+   Example:
+   ├─ Upstream system started outputting NaN in numeric column
+   ├─ Spark casting fails; exception handlers trigger
+   ├─ Each exception = expensive logging, retry logic
+   └─ 1000s of retries → 2 hours → 6 hours
+
+   Fix: Check data quality
+   ───────────────────────────────────────────────────────────────
+   # Profile input data
+   df.show(100)
+   df.dtypes
+   df.select("*").filter(col("amount").isNull()).count()
+   ───────────────────────────────────────────────────────────────
+
+7. CODE PATH CHANGE
+
+   Was there a deployment between the last fast run and today?
+
+   Git:
+   ───────────────────────────────────────────────────────────────
+   git log --oneline -20  # Recent commits
+   git show <commit_hash> # Diff of specific commit
+   ───────────────────────────────────────────────────────────────
+
+   Common slow patterns:
+   ├─ Added: expensive UDF (scalar, not vectorized)
+   ├─ Changed: join order (different shuffle size)
+   ├─ Added: extra GROUP BY step (cascading aggregations)
+   └─ Removed: partition pruning (now reads more data)
+
+ROOT CAUSE TEMPLATE (for communicating findings):
+──────────────────────────────────────────────
+
+   "The job slowed from 2h → 6h because [ROOT_CAUSE].
+
+    This was triggered by [CHANGE] on [DATE].
+
+    Impact: [COST/SLA] (e.g., '$5K additional compute cost')
+
+    Fix applied: [ACTION_TAKEN]
+
+    Prevention: [MONITORING_OR_TEST_ADDED]"
+
+   Example:
+   ───────────────────────────────────────────────────────────────
+   "The job slowed from 2h → 6h because upstream schema added
+    a new CATEGORY field (5 → 500 unique values), tripling the
+    GROUP BY cardinality and shuffle volume.
+
+    This was triggered by a data schema change in the source
+    system on May 20.
+
+    Impact: $2K additional compute cost (3× cluster usage)
+
+    Fix applied: Rewrite aggregation to group by (category) only,
+    post-filter on subcategory instead (pushes predicate)
+
+    Prevention: Added dbt test to alert on GROUP BY cardinality
+    explosion; requires approval before merge"
+   ───────────────────────────────────────────────────────────────
+
+═══════════════════════════════════════════════════════════════════════════════
+ROUND 3 — MANAGERIAL / BEHAVIOURAL
+═══════════════════════════════════════════════════════════════════════════════
+
+Use the STAR method for all answers:
+   Situation → Task → Action → Result
+
+Q1. Tell me about a time you handled a production issue under pressure.
+
+EXAMPLE ANSWER STRUCTURE:
+
+SITUATION:
+   "Our main data pipeline feeding the executive dashboard went down at
+   9 AM on a Monday — the first business day of quarter-end reporting.
+   Leadership needed accurate revenue numbers for investor calls at 2 PM."
+
+TASK:
+   "I was the on-call engineer that morning. I needed to restore data
+   within the SLA (2 hours) while keeping stakeholders informed."
+
+ACTION:
+   "1. Immediately checked deployment logs → found a Kafka broker had
+      been restarted for maintenance, triggering a consumer group
+      rebalancing storm.
+
+    2. Paused all downstream consumers to stop the rebalance loop.
+
+    3. Manually reset consumer offsets to the last committed checkpoint
+      using kafka-consumer-groups CLI.
+
+    4. Restarted consumers one at a time, with staggered delays, to
+       prevent cascading failures.
+
+    5. Posted status updates in Slack every 15 minutes so leadership
+       knew progress even while I was troubleshooting."
+
+RESULT:
+   "Pipeline restored in 45 minutes. Zero data loss because Kafka
+   retention was set to 24 hours. Post-mortem identified that we had
+   no canary procedure for broker restarts. I created:
+
+   ├─ Documented runbook for broker restart procedures
+   ├─ Automated canary consumer that re-joins first
+   ├─ Alert for rebalance rate spike (prevents future occurrences)
+
+   This prevented the same issue from happening again; 6 months later
+   we had 2 more broker restarts with zero downtime."
+
+KEY TRAITS TO CONVEY:
+   ✓ Calm under pressure (didn't panic)
+   ✓ Methodical diagnosis (didn't guess blindly)
+   ✓ Proactive communication (stakeholders stayed informed)
+   ✓ Focus on prevention (didn't just fix; prevented recurrence)
+   ✓ Willingness to learn (post-mortem, documentation, alerts)
+
+Q2. How do you explain technical solutions to non-technical clients?
+
+FRAMEWORK:
+
+1. LEAD WITH BUSINESS OUTCOME (not technology)
+
+   ❌ Bad: "We implemented CDC with Debezium and Kafka."
+   ✓ Good: "Your reports will now refresh every 5 minutes instead of
+            overnight, so you can make decisions based on today's data
+            instead of yesterday's."
+
+2. USE ANALOGIES (map tech to everyday objects)
+
+   Kafka = "a post office that keeps every letter for 7 days, so nothing
+           is lost even if the recipient is temporarily unavailable"
+
+   Redis cache = "a whiteboard next to your desk — faster to look at
+                  than going to the filing cabinet every time"
+
+   Data lake = "a warehouse that stores everything; analytics = a team
+               that combs through it to find insights"
+
+3. QUANTIFY THE BENEFIT (clients respond to numbers)
+
+   ✓ "This reduces your report refresh time from 8 hours to 10 minutes"
+   ✓ "This saves approximately £50K/month in query compute costs"
+   ✓ "This enables 2× more daily report runs without increasing costs"
+
+4. CHECK FOR UNDERSTANDING (ask, don't assume)
+
+   "Does this make sense so far? Is there a part I should explain
+    differently?"
+
+   If they say "yes but I don't understand Kafka," pivot:
+   "Great — forget about Kafka for a moment. Think of it as a reliable
+    message queue. Your data goes in one end, comes out the other, and
+    we can replay if something breaks."
+
+5. AVOID JARGON (unless client demonstrates comfort)
+
+   Unless they use terms like "partition," "cardinality," "idempotent,"
+   stick to business language.
+
+Q3. Client has unrealistic delivery timeline. How do you handle it?
+
+STEPS:
+
+1. ACKNOWLEDGE URGENCY FIRST
+
+   "I understand this deadline is important. Help me understand why
+    this date matters — is there a regulatory requirement, competitive
+    pressure, or something else I should know?"
+
+   This shows you care about their business, not just pushback.
+
+2. SHOW YOUR WORK (numbers are harder to argue with)
+
+   Breakdown:
+   ────────────────────────────────────────────────────────────────
+   Feature A: Design (2 days) + Build (5 days) = 7 days
+      └─ Blocks Feature B
+
+   Feature B: Design (1 day) + Build (3 days) = 4 days
+
+   Feature C: Design (1 day) + Build (2 days) = 3 days
+
+   Testing + QA: 3 days
+
+   TOTAL: 7 + 4 + 3 = 14 days minimum
+   YOUR REQUEST: 5 days
+   ────────────────────────────────────────────────────────────────
+
+3. OFFER OPTIONS (not a flat "no")
+
+   "We have three options:
+
+   Option 1: Phased delivery
+   ├─ Deliver MVP (Features A + B only) in 5 days
+   └─ Full scope (+ Feature C) in 3 weeks
+
+   Option 2: Scope reduction
+   ├─ Which features are essential for day 5?
+   ├─ Which can ship a week later?
+   └─ Prioritize ruthlessly
+
+   Option 3: Additional resources
+   ├─ Can we add a second engineer to parallelize work?
+   ├─ Budget constraints, or is this possible?
+
+   Which of these works for your business?"
+
+4. DOCUMENT THE AGREED COMPROMISE
+
+   Email recap after the call:
+   ───────────────────────────────────────────────────────────────
+   "Hi [Client],
+
+   Thanks for the call. Confirming our agreement:
+
+   • Deliver MVP (Features A, B) by [DATE]
+   • Full scope (+ C) by [DATE + 2 weeks]
+   • Engineering team: 2 people (you + [engineer name])
+   • Technical debt acknowledged: we'll address [X] after launch
+
+   Next step: I'll send detailed scope document by EOD Wednesday.
+   ───────────────────────────────────────────────────────────────
+
+5. BE HONEST ABOUT RISK
+
+   "If we rush and cut corners on QA, we risk:
+   ├─ Bugs in production (impacts your users)
+   ├─ Technical debt that slows future features
+   └─ Burnout for the team
+
+   Are you comfortable with this trade-off, or should we push the
+   deadline to keep quality?"
+
+   This puts the risk decision in the client's hands — they own it.
+
+Q4. Multiple teams, conflicting priorities. How did you manage deadlines?
+
+EXAMPLE ANSWER:
+
+SITUATION:
+   "The data platform team, analytics team, and product team all needed
+   deliverables from me in the same two-week sprint. Platform needed
+   Kafka cluster migration; analytics needed new API queries; product
+   needed real-time dashboard."
+
+TASK:
+   "Prioritize work, manage expectations, and deliver all three without
+    burning out or dropping quality."
+
+ACTION:
+   "1. Listed all requests with:
+      ├─ Deadline (when needed)
+      ├─ Duration (how long to build)
+      ├─ Blocker status (what does each depend on?)
+      └─ Business impact (revenue, SLA, reputation)
+
+    2. Identified critical path: migration blocked analytics work, so
+       migration had to go first (dependencies matter).
+
+    3. Escalated conflict to engineering manager with a dependency
+       diagram. Leadership arbitrated the final priority order:
+       └─ Platform migration (day 1–4)
+       └─ Analytics queries (day 5–8)
+       └─ Product dashboard (day 9–14)
+
+    4. Communicated agreed sequence to all three teams. Each knew:
+       ├─ When to expect their deliverable
+       └─ Why (because of dependencies, not arbitrary)
+
+    5. Used shared Jira board (one source of truth). Stakeholders could
+       see progress without asking me for status every day."
+
+RESULT:
+   "All three shipped within the sprint on schedule:
+   ├─ Migration: day 4 (1 day early)
+   ├─ Analytics: day 8 (on time)
+   ├─ Product: day 12 (2 days early)
+
+   No surprises for any team. Post-sprint feedback was positive on
+   transparency and communication. This became our template for
+   multi-team prioritization in future sprints."
+
+KEY TRAITS TO CONVEY:
+   ✓ Structured thinking (dependencies, impact analysis)
+   ✓ Escalation when appropriate (didn't try to be a hero)
+   ✓ Transparency (kept everyone informed)
+   ✓ Communication skills (clear deadlines, no surprises)
+
+═══════════════════════════════════════════════════════════════════════════════
+HOW TO PRACTISE THESE ANSWERS
+═══════════════════════════════════════════════════════════════════════════════
+
+1. RECORD YOURSELF
+   ├─ Speak each answer aloud
+   ├─ Time it (target: 2–3 minutes per answer)
+   └─ Listen back for: filler words ("um," "like"), clarity, pacing
+
+2. DRAW ARCHITECTURE
+   ├─ For Q1, Q4 (Round 1) and Q1–Q5 (Round 2): practice sketching
+   ├─ Use whiteboard or paper
+   └─ Practice explaining while drawing
+
+3. TIE ANSWERS TO THIS CODEBASE
+   ├─ For every technical question: "I implemented something similar"
+   ├─ Walk the interviewer through your actual code
+   └─ Example: "In src/fraud_detector.py, I implemented 7 rules…"
+
+4. PREPARE YOUR OWN STORIES (Round 3)
+   ├─ Replace example stories with your actual experiences
+   ├─ Authenticity > polish
+   └─ Practice until you can tell them without notes
+
+5. MOCK INTERVIEWS
+   ├─ Find a peer or mentor
+   ├─ Do 1 mock per round (3 total)
+   ├─ Focus on questions that feel hardest
+   └─ Get feedback on clarity, technical depth, communication
+
+═══════════════════════════════════════════════════════════════════════════════
+QUICK REFERENCE: FRAUD DETECTION IN THIS PROJECT
+═══════════════════════════════════════════════════════════════════════════════
+
+Component               File                       What it does
+───────────────────────────────────────────────────────────────────────────────
+Rule engine             src/fraud_detector.py      Scores each user record
+                                                    Returns risk level + signals
+
+Consumer integration    src/consumer.py            Calls score_record() on every
+                                                    Kafka message
+                                                    Stores fraud result in Redis
+
+GraphQL API             src/api.py                 getHighRiskUsers
+                                                    getSuspiciousUsers
+                                                    getFraudResult
+                                                    getAllFraudAlerts
+
+Risk levels             fraud_detector.py          CLEAN (0–30)
+                                                    SUSPICIOUS (31–60)
+                                                    HIGH_RISK (61+)
+
+Rules (7 total)         fraud_detector.py          • Unverified + high spend
+                                                    • No-2FA + enterprise plan
+                                                    • Zero logins + purchase
+                                                    • Low engagement + high spend
+                                                    • Risk tag + high spend
+                                                    • Inactive + recent purchase
+                                                    • Large single purchase (>$400)
+
+═══════════════════════════════════════════════════════════════════════════════
+End of Interview Prep Guide
+═══════════════════════════════════════════════════════════════════════════════
