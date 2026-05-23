@@ -2,7 +2,7 @@
 api.py
 ------
 GraphQL API built with Strawberry + FastAPI.
-Reads user data from Redis and serves it to consumers.
+Reads user data and fraud detection results from Redis.
 
 Flow:
   Consumer (browser/app/service)
@@ -13,7 +13,7 @@ Flow:
       │
       │  hgetall / keys
       ▼
-  Redis Cache
+  Redis Cache  (user:* and fraud:* keys)
 
 Run with:
   uvicorn src.api:app --reload --port 8000
@@ -52,6 +52,7 @@ REDIS_CONFIG = {
 }
 
 REDIS_KEY_PREFIX = "user:"
+REDIS_FRAUD_PREFIX = "fraud:"
 
 # Create a single shared Redis client for the whole API
 redis_client = redis.Redis(**REDIS_CONFIG)
@@ -75,7 +76,6 @@ def get_all_users_from_redis() -> list[dict]:
     Fetches all user records from Redis.
     Uses KEYS pattern to find all user:* keys.
     """
-    # keys("user:*") returns all Redis keys matching the pattern
     keys = redis_client.keys(f"{REDIS_KEY_PREFIX}*")
     users = []
     for key in keys:
@@ -83,6 +83,30 @@ def get_all_users_from_redis() -> list[dict]:
         if data:
             users.append(data)
     return users
+
+
+def get_fraud_result_from_redis(user_id: str) -> Optional[dict]:
+    """Fetches a single fraud result by user ID. Returns None if not found."""
+    key = f"{REDIS_FRAUD_PREFIX}{user_id}"
+    data = redis_client.hgetall(key)
+    return data if data else None
+
+
+def get_all_fraud_results_from_redis(risk_level: Optional[str] = None) -> list[dict]:
+    """
+    Fetches all fraud results from Redis.
+    If risk_level is provided, filters to that tier (CLEAN/SUSPICIOUS/HIGH_RISK).
+    """
+    keys = redis_client.keys(f"{REDIS_FRAUD_PREFIX}*")
+    results = []
+    for key in keys:
+        data = redis_client.hgetall(key)
+        if not data:
+            continue
+        if risk_level and data.get("risk_level") != risk_level:
+            continue
+        results.append(data)
+    return results
 
 # ---------------------------------------------------------------------------
 # GraphQL Schema — defines the shape of the data
@@ -92,8 +116,7 @@ def get_all_users_from_redis() -> list[dict]:
 class User:
     """
     Represents a user in the GraphQL schema.
-    Each field here maps to a field in the Redis hash.
-    @strawberry.type tells Strawberry this is a GraphQL type.
+    Each field maps to a field in the Redis hash.
     """
     id: str
     name: str
@@ -115,6 +138,31 @@ class User:
     browser: str
     metadata: Optional[str]       # stored as JSON string in Redis
     created_at: str
+
+
+@strawberry.type
+class FraudAlert:
+    """
+    Represents a fraud detection result for a single user.
+    Populated by the fraud_detector module and stored under "fraud:<user_id>" in Redis.
+
+    Example GraphQL query:
+      query {
+        getHighRiskUsers {
+          userId
+          score
+          riskLevel
+          signals
+          evaluatedAt
+        }
+      }
+    """
+    user_id: str
+    score: str           # integer score 0–100 (stored as string in Redis)
+    risk_level: str      # CLEAN | SUSPICIOUS | HIGH_RISK
+    signal_count: str    # number of triggered rules (stored as string)
+    signals: str         # JSON array of triggered signal objects
+    evaluated_at: str    # ISO-8601 UTC timestamp
 
 
 @strawberry.type
@@ -222,6 +270,89 @@ class Query:
         log.info("Serving %d users from country='%s'", len(filtered), country)
         return [User(**u) for u in filtered]
 
+    # -----------------------------------------------------------------------
+    # Fraud detection queries
+    # -----------------------------------------------------------------------
+
+    @strawberry.field
+    def get_fraud_result(self, user_id: str) -> Optional[FraudAlert]:
+        """
+        Fetch the fraud detection result for a specific user.
+
+        Example GraphQL query:
+          query {
+            getFraudResult(userId: "42") {
+              userId
+              score
+              riskLevel
+              signals
+            }
+          }
+        """
+        data = get_fraud_result_from_redis(user_id)
+        if not data:
+            log.warning("No fraud result for user_id=%s", user_id)
+            return None
+        log.info("Serving fraud result for user_id=%s risk=%s", user_id, data.get("risk_level"))
+        return FraudAlert(**data)
+
+    @strawberry.field
+    def get_all_fraud_alerts(self) -> list[FraudAlert]:
+        """
+        Fetch all fraud results regardless of risk level.
+
+        Example GraphQL query:
+          query {
+            getAllFraudAlerts {
+              userId
+              score
+              riskLevel
+              signalCount
+            }
+          }
+        """
+        results = get_all_fraud_results_from_redis()
+        log.info("Serving %d total fraud results", len(results))
+        return [FraudAlert(**r) for r in results]
+
+    @strawberry.field
+    def get_high_risk_users(self) -> list[FraudAlert]:
+        """
+        Fetch only HIGH_RISK fraud alerts — the users needing immediate review.
+
+        Example GraphQL query:
+          query {
+            getHighRiskUsers {
+              userId
+              score
+              signals
+              evaluatedAt
+            }
+          }
+        """
+        results = get_all_fraud_results_from_redis(risk_level="HIGH_RISK")
+        log.info("Serving %d HIGH_RISK fraud alerts", len(results))
+        return [FraudAlert(**r) for r in results]
+
+    @strawberry.field
+    def get_suspicious_users(self) -> list[FraudAlert]:
+        """
+        Fetch SUSPICIOUS fraud alerts — users worth monitoring but not yet high risk.
+
+        Example GraphQL query:
+          query {
+            getSuspiciousUsers {
+              userId
+              score
+              riskLevel
+              signals
+            }
+          }
+        """
+        results = get_all_fraud_results_from_redis(risk_level="SUSPICIOUS")
+        log.info("Serving %d SUSPICIOUS fraud alerts", len(results))
+        return [FraudAlert(**r) for r in results]
+
 
 # ---------------------------------------------------------------------------
 # FastAPI app + GraphQL route
@@ -233,8 +364,8 @@ schema = strawberry.Schema(query=Query)
 # Create the FastAPI application
 app = FastAPI(
     title="User Pipeline GraphQL API",
-    description="Serves user data from Redis via GraphQL",
-    version="1.0.0",
+    description="Serves user data and fraud detection results from Redis via GraphQL",
+    version="2.0.0",
 )
 
 # Mount the GraphQL endpoint at /graphql

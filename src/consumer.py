@@ -1,14 +1,15 @@
 """
 consumer.py
 -----------
-The Consumer reads messages from a Kafka topic and writes
-each user record into Redis as a cache.
+The Consumer reads messages from a Kafka topic, writes each user record
+into Redis, and runs fraud detection on every record.
 
 Flow:
-  Kafka Topic --> poll messages --> write to Redis
+  Kafka Topic --> poll messages --> fraud scoring --> write to Redis
+                                                  --> write fraud result to Redis
 
-This runs as a long-running service — it keeps listening
-for new messages until you stop it (Ctrl+C).
+Fraud results are stored under the key prefix "fraud:" so the GraphQL API
+can serve them alongside normal user data.
 
 Run with:
   python src/consumer.py
@@ -25,6 +26,8 @@ load_dotenv()
 
 import redis
 from confluent_kafka import Consumer, KafkaException, KafkaError
+
+from fraud_detector import score_record, is_flagged, is_high_risk
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -62,28 +65,43 @@ REDIS_CONFIG = {
     "decode_responses": True,
 }
 
-REDIS_KEY_PREFIX = "user:"    # keys stored as "user:1", "user:2", etc.
-REDIS_TTL_SECONDS = 3600      # records expire after 1 hour
+REDIS_KEY_PREFIX = "user:"         # user records: "user:1", "user:2", etc.
+REDIS_FRAUD_PREFIX = "fraud:"      # fraud results: "fraud:1", "fraud:2", etc.
+REDIS_TTL_SECONDS = 3600           # records expire after 1 hour
 
 # ---------------------------------------------------------------------------
-# Redis writer
+# Redis writers
 # ---------------------------------------------------------------------------
 
 def write_to_redis(client: redis.Redis, record: dict) -> None:
     """
     Writes a single user record to Redis as a hash.
     Key format: "user:<id>"
-    All values are converted to strings (Redis requirement).
     """
     redis_key = f"{REDIS_KEY_PREFIX}{record.get('id', 'unknown')}"
-
-    # hset stores a dictionary as a Redis hash (field-value pairs)
     client.hset(redis_key, mapping={k: str(v) for k, v in record.items()})
-
-    # expire sets auto-deletion after TTL seconds
     client.expire(redis_key, REDIS_TTL_SECONDS)
-
     log.debug("Cached record to Redis key '%s'", redis_key)
+
+
+def write_fraud_result_to_redis(client: redis.Redis, result: dict) -> None:
+    """
+    Stores a fraud detection result in Redis.
+    Key format: "fraud:<user_id>"
+    Signals are JSON-serialised so they survive the Redis hash round-trip.
+    """
+    redis_key = f"{REDIS_FRAUD_PREFIX}{result['user_id']}"
+    payload = {
+        "user_id":      result["user_id"],
+        "score":        str(result["score"]),
+        "risk_level":   result["risk_level"],
+        "signal_count": str(len(result["signals"])),
+        "signals":      json.dumps(result["signals"]),
+        "evaluated_at": result["evaluated_at"],
+    }
+    client.hset(redis_key, mapping=payload)
+    client.expire(redis_key, REDIS_TTL_SECONDS)
+    log.debug("Stored fraud result to Redis key '%s'", redis_key)
 
 # ---------------------------------------------------------------------------
 # Consumer loop
@@ -121,6 +139,8 @@ def run_consumer() -> None:
     # Counters for the summary
     processed = 0
     failed = 0
+    fraud_flagged = 0
+    fraud_high_risk = 0
 
     log.info("Consumer is running — press Ctrl+C to stop")
 
@@ -148,11 +168,36 @@ def run_consumer() -> None:
             # msg.value() returns the message as bytes — decode to string, then parse JSON
             record = json.loads(msg.value().decode("utf-8"))
 
-            # Write the record to Redis
+            # Write the user record to Redis
             write_to_redis(redis_client, record)
 
+            # Run fraud detection and store the result
+            fraud_result = score_record(record)
+            write_fraud_result_to_redis(redis_client, fraud_result)
+
+            if is_high_risk(fraud_result):
+                fraud_high_risk += 1
+                log.warning(
+                    "HIGH_RISK user id=%s score=%d signals=%s",
+                    fraud_result["user_id"],
+                    fraud_result["score"],
+                    [s["rule"] for s in fraud_result["signals"]],
+                )
+            elif is_flagged(fraud_result):
+                fraud_flagged += 1
+                log.info(
+                    "SUSPICIOUS user id=%s score=%d",
+                    fraud_result["user_id"],
+                    fraud_result["score"],
+                )
+
             processed += 1
-            log.info("Processed record id=%s | total processed=%d", record.get("id"), processed)
+            log.info(
+                "Processed record id=%s risk=%s | total=%d",
+                record.get("id"),
+                fraud_result["risk_level"],
+                processed,
+            )
 
         except json.JSONDecodeError as exc:
             # Message was not valid JSON — skip it
@@ -174,7 +219,11 @@ def run_consumer() -> None:
     print("=" * 50)
     print(f"  Messages processed : {processed}")
     print(f"  Messages failed    : {failed}")
+    print(f"  Fraud HIGH_RISK    : {fraud_high_risk}")
+    print(f"  Fraud SUSPICIOUS   : {fraud_flagged}")
+    print(f"  Fraud CLEAN        : {processed - fraud_high_risk - fraud_flagged}")
     print(f"  Redis key prefix   : {REDIS_KEY_PREFIX}")
+    print(f"  Fraud key prefix   : {REDIS_FRAUD_PREFIX}")
     print(f"  Redis TTL          : {REDIS_TTL_SECONDS}s")
     print("=" * 50 + "\n")
 
